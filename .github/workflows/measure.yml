@@ -17,13 +17,15 @@ on:
       sha:         { description: "commit to test", required: true, type: string }
       image:       { description: "go | typescript | python | rust | cpp | jvm", required: true, type: string }
       command:     { description: "test command", required: true, type: string }
-      timeout_min: { description: "limit per test run", required: false, type: string, default: "40" }
+      timeout_min: { description: "limit per test run; over it means too slow", required: false, type: string, default: "10" }
 
 permissions: {}
 
 jobs:
   measure:
     runs-on: ubuntu-latest
+    # Safety net only. The per-stage limits below are what end slow runs and
+    # record which stage was slow; this exists for a hang they do not catch.
     timeout-minutes: 120
     steps:
       - name: measure
@@ -36,7 +38,9 @@ jobs:
           IN_TIMEOUT: ${{ inputs.timeout_min }}
           IN_ID: ${{ inputs.request_id }}
         run: |
-          set -u
+          # GitHub runs this with bash -e. Failures are recorded per stage instead of
+          # aborting the script, so errexit is switched off; every stage keeps its rc.
+          set +e -u
           mkdir -p out
           : > out/stages.txt
 
@@ -45,7 +49,7 @@ jobs:
           [[ "$IN_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "bad repo"; exit 2; }
           [[ "$IN_SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "bad sha"; exit 2; }
           case "$IN_IMAGE" in go|typescript|python|rust|cpp|jvm) ;; *) echo "bad image"; exit 2;; esac
-          [[ "$IN_TIMEOUT" =~ ^[0-9]+$ ]] || IN_TIMEOUT=40
+          [[ "$IN_TIMEOUT" =~ ^[0-9]+$ ]] || IN_TIMEOUT=10
           IMAGE="${IMAGE_PREFIX}${IN_IMAGE}:latest"
 
           now() { date +%s.%N; }
@@ -86,17 +90,18 @@ jobs:
           trap finish EXIT
 
           # Clone on the host: shallow fetch by SHA, full clone if the SHA is short.
-          stage clone bash -c 'git init -q src && git -C src fetch -q --depth 1 "https://github.com/$IN_REPO" "$IN_SHA" && git -C src checkout -q FETCH_HEAD' \
-            || stage clone_full bash -c 'rm -rf src && git clone -q "https://github.com/$IN_REPO" src && git -C src checkout -q "$IN_SHA"' \
+          stage clone timeout 5m bash -c 'git init -q src && git -C src fetch -q --depth 1 "https://github.com/$IN_REPO" "$IN_SHA" && git -C src checkout -q FETCH_HEAD' \
+            || stage clone_full timeout 5m bash -c 'rm -rf src && git clone -q "https://github.com/$IN_REPO" src && git -C src checkout -q "$IN_SHA"' \
             || exit 0
           stage submodules git -C src submodule update --init --recursive --depth 1 -q || true
 
-          stage pull docker pull -q "$IMAGE" || exit 0
+          stage pull timeout 10m docker pull -q "$IMAGE" || exit 0
 
           # One long-lived container so install and both test runs share state.
+          # Docker names need at least two characters -- "w" fails before anything runs.
           # Root avoids uid clashes on the bind mount; a few suites behave
           # differently as root, which is recorded in the result.
-          docker run -d --name w --user 0:0 -v "$PWD/src:/work" -w /work --entrypoint sleep "$IMAGE" infinity >/dev/null || exit 0
+          docker run -d --name bench --user 0:0 -v "$PWD/src:/work" -w /work --entrypoint sleep "$IMAGE" infinity >/dev/null || exit 0
 
           # Base-image traps, applied before anything runs. Each of these makes a
           # healthy repo look broken if ignored.
@@ -105,7 +110,7 @@ jobs:
             rust)       ENVSH='export CI=true PATH=/opt/cargo/bin:$PATH' ;;  # cargo is not on PATH
             *)          ENVSH='export CI=true' ;;
           esac
-          docker exec -i w bash -c 'cat > /tmp/env.sh' <<< "$ENVSH"
+          docker exec -i bench bash -c 'cat > /tmp/env.sh' <<< "$ENVSH"
 
           case "$IN_IMAGE" in
             typescript) INSTALL='if [ -f pnpm-lock.yaml ]; then corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile --prod=false || pnpm install --prod=false; elif [ -f yarn.lock ]; then corepack enable >/dev/null 2>&1; yarn install --frozen-lockfile --production=false || yarn install --production=false; elif [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi' ;;
@@ -117,11 +122,11 @@ jobs:
           esac
           # bash -c, not -lc: a login shell re-reads /etc/profile and resets the
           # PATH the image set, which hides go, cargo and friends.
-          stage install docker exec -e INSTALL="$INSTALL" w bash -c '. /tmp/env.sh; eval "$INSTALL"' || true
+          stage install docker exec -e INSTALL="$INSTALL" bench bash -c '. /tmp/env.sh; timeout 15m bash -c "$INSTALL"' || true
 
           # Twice: the first run pays for compilation and cold caches.
           for run in test_cold test_warm; do
-            stage "$run" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" w bash -c '. /tmp/env.sh; timeout "${T}m" bash -c "$IN_CMD"' || true
+            stage "$run" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" bench bash -c '. /tmp/env.sh; timeout "${T}m" bash -c "$IN_CMD"' || true
           done
 
       - name: upload
