@@ -298,12 +298,17 @@ jobs:
           esac
           docker exec -i bench bash -c 'cat > /tmp/env.sh' <<< "$ENVSH"
 
+          # Install uses ONLY what a platform Dockerfile may do -- build, never run
+          # tests -- so every measurement doubles as proof that the generic recipe
+          # for that ecosystem works with the network off. Maven is the case that
+          # forced this: dependency:go-offline alone misses plugin dependencies
+          # (Chronicle-Wire's checkstyle rules jar), so test-compile follows it.
           case "$IN_IMAGE" in
             typescript) INSTALL='if [ -f pnpm-lock.yaml ]; then corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile --prod=false || pnpm install --prod=false; elif [ -f yarn.lock ]; then corepack enable >/dev/null 2>&1; yarn install --frozen-lockfile --production=false || yarn install --production=false; elif [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi' ;;
             go)         INSTALL='go mod download' ;;
             python)     INSTALL='python -m pip install -q -e . || python -m pip install -q -r requirements.txt; python -m pip install -q pytest' ;;  # never .[all]
-            rust)       INSTALL='cargo fetch' ;;
-            jvm)        INSTALL='mkdir -p ~/.gradle && printf "org.gradle.java.installations.paths=/opt/jdk-25\norg.gradle.java.installations.auto-download=false\n" >> ~/.gradle/gradle.properties; if [ -x ./gradlew ]; then ./gradlew --no-daemon -q dependencies >/dev/null || true; elif [ -f pom.xml ]; then mvn -q -B dependency:go-offline || true; fi' ;;
+            rust)       INSTALL='cargo fetch && cargo build --tests' ;;  # compiles test binaries, runs none
+            jvm)        INSTALL='mkdir -p ~/.gradle && printf "org.gradle.java.installations.paths=/opt/jdk-25\norg.gradle.java.installations.auto-download=false\n" >> ~/.gradle/gradle.properties; if [ -x ./gradlew ]; then ./gradlew --no-daemon -q testClasses; elif [ -f pom.xml ]; then mvn -B -ntp -q dependency:go-offline; mvn -B -ntp -q -DskipTests test-compile; fi' ;;
             cpp)        INSTALL='true' ;;
           esac
           # bash -c, not -lc: a login shell re-reads /etc/profile and resets the
