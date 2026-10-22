@@ -238,8 +238,6 @@ jobs:
               # excluded; tests inside it cannot, so this is what decides whether a
               # flaky repo is still usable and where in it a task can live.
               "problem_areas": problem_areas(flaky, always_fail),
-              "tests_ran_offline": (out / "test_network").exists()
-                                   and (out / "test_network").read_text().strip() == "none",
           }
           json.dump({
               "request_id": os.environ["IN_ID"], "repo": os.environ["IN_REPO"],
@@ -298,32 +296,24 @@ jobs:
           esac
           docker exec -i bench bash -c 'cat > /tmp/env.sh' <<< "$ENVSH"
 
-          # Install uses ONLY what a platform Dockerfile may do -- build, never run
-          # tests -- so every measurement doubles as proof that the generic recipe
-          # for that ecosystem works with the network off. Maven is the case that
-          # forced this: dependency:go-offline alone misses plugin dependencies
-          # (Chronicle-Wire's checkstyle rules jar), so test-compile follows it.
+          # Install is best-effort: get dependencies in so the tests can run. The point
+          # here is comparing how fast repos are, not proving a Dockerfile -- offline
+          # fidelity is solved per submission, when that Dockerfile is written.
           case "$IN_IMAGE" in
             typescript) INSTALL='if [ -f pnpm-lock.yaml ]; then corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile --prod=false || pnpm install --prod=false; elif [ -f yarn.lock ]; then corepack enable >/dev/null 2>&1; yarn install --frozen-lockfile --production=false || yarn install --production=false; elif [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi' ;;
             go)         INSTALL='go mod download' ;;
             python)     INSTALL='python -m pip install -q -e . || python -m pip install -q -r requirements.txt; python -m pip install -q pytest' ;;  # never .[all]
             rust)       INSTALL='cargo fetch && cargo build --tests' ;;  # compiles test binaries, runs none
-            jvm)        INSTALL='mkdir -p ~/.gradle && printf "org.gradle.java.installations.paths=/opt/jdk-25\norg.gradle.java.installations.auto-download=false\n" >> ~/.gradle/gradle.properties; if [ -x ./gradlew ]; then ./gradlew --no-daemon -q testClasses; elif [ -f pom.xml ]; then mvn -B -ntp -q dependency:go-offline; mvn -B -ntp -q -DskipTests test-compile; fi' ;;
+            jvm)        INSTALL='mkdir -p ~/.gradle && printf "org.gradle.java.installations.paths=/opt/jdk-25\norg.gradle.java.installations.auto-download=false\n" >> ~/.gradle/gradle.properties; if [ -x ./gradlew ]; then ./gradlew --no-daemon -q testClasses; elif [ -f pom.xml ]; then mvn -B -ntp -q -DskipTests test-compile || true; fi' ;;
             cpp)        INSTALL='true' ;;
           esac
           # bash -c, not -lc: a login shell re-reads /etc/profile and resets the
           # PATH the image set, which hides go, cargo and friends.
           stage install docker exec -e INSTALL="$INSTALL" bench bash -c '. /tmp/env.sh; timeout 15m bash -c "$INSTALL"' || true
 
-          # The platform builds with network and runs every test with --network none.
-          # So installs happen online and tests offline, here too. A test that reaches
-          # the network then fails in every run and lands in always_fail -- which is
-          # exactly where it belongs, as an exclusion it needs in test.sh.
-          if docker network disconnect bridge bench >/dev/null 2>&1; then
-            echo none > out/test_network
-          else
-            echo "connected (disconnect failed)" > out/test_network
-          fi
+          # Tests run WITH network, deliberately. Offline cost whole measurements for
+          # setup reasons -- Chronicle-Wire passed 11,407 tests online and produced
+          # nothing offline -- while barely changing how long a suite takes.
 
           # Every run starts with no test reports, so each run's results are its own.
           # Removing Gradle's results also stops it skipping the test task as
