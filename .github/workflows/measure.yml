@@ -105,8 +105,12 @@ jobs:
 
           # Base-image traps, applied before anything runs. Each of these makes a
           # healthy repo look broken if ignored.
+          # The result-cache switches keep the WARM run honest: it should reuse the
+          # build, not replay the cold run's results. Without -count=1 a second
+          # `go test` prints "(cached)" for every package and executes nothing.
           case "$IN_IMAGE" in
-            typescript) ENVSH='export CI=true NODE_ENV=development' ;;   # NODE_ENV=production drops devDeps
+            typescript) ENVSH='export CI=true NODE_ENV=development TURBO_FORCE=true NX_SKIP_NX_CACHE=true' ;;   # NODE_ENV=production drops devDeps
+            go)         ENVSH='export CI=true GOFLAGS=-count=1' ;;
             rust)       ENVSH='export CI=true PATH=/opt/cargo/bin:$PATH' ;;  # cargo is not on PATH
             *)          ENVSH='export CI=true' ;;
           esac
@@ -126,6 +130,9 @@ jobs:
 
           # Twice: the first run pays for compilation and cold caches.
           for run in test_cold test_warm; do
+            # Gradle skips a test task whose outputs exist; removing them forces the
+            # tests to run while compilation stays up to date.
+            [ "$IN_IMAGE" = jvm ] && docker exec bench bash -c "find . -type d -path '*/build/test-results' -prune -exec rm -rf {} +" >/dev/null 2>&1
             stage "$run" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" bench bash -c '. /tmp/env.sh; timeout "${T}m" bash -c "$IN_CMD"' || true
           done
 
