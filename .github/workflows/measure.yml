@@ -1,0 +1,134 @@
+# Measures how long a repository's existing test suite takes inside a base image.
+#
+# Copy to .github/workflows/measure.yml in the runner repo. It is committed ONCE:
+# everything per-run arrives as dispatch inputs, so git history never grows.
+#
+# The base image's registry path is a repository SECRET (IMAGE_PREFIX), never an
+# input: secrets are masked from the first line of the log, while inputs print in
+# step headers before any ::add-mask:: can take effect. The input is a bare key.
+name: measure
+run-name: ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:  { description: "opaque id, used to find this run", required: true, type: string }
+      repo:        { description: "owner/name", required: true, type: string }
+      sha:         { description: "commit to test", required: true, type: string }
+      image:       { description: "go | typescript | python | rust | cpp | jvm", required: true, type: string }
+      command:     { description: "test command", required: true, type: string }
+      timeout_min: { description: "limit per test run", required: false, type: string, default: "40" }
+
+permissions: {}
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: measure
+        env:
+          IMAGE_PREFIX: ${{ secrets.IMAGE_PREFIX }}
+          IN_REPO: ${{ inputs.repo }}
+          IN_SHA: ${{ inputs.sha }}
+          IN_IMAGE: ${{ inputs.image }}
+          IN_CMD: ${{ inputs.command }}
+          IN_TIMEOUT: ${{ inputs.timeout_min }}
+          IN_ID: ${{ inputs.request_id }}
+        run: |
+          set -u
+          mkdir -p out
+          : > out/stages.txt
+
+          # Shape-check the inputs before they reach a shell. The command is the one
+          # free-form field, and running it is the point of the job.
+          [[ "$IN_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "bad repo"; exit 2; }
+          [[ "$IN_SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "bad sha"; exit 2; }
+          case "$IN_IMAGE" in go|typescript|python|rust|cpp|jvm) ;; *) echo "bad image"; exit 2;; esac
+          [[ "$IN_TIMEOUT" =~ ^[0-9]+$ ]] || IN_TIMEOUT=40
+          IMAGE="${IMAGE_PREFIX}${IN_IMAGE}:latest"
+
+          now() { date +%s.%N; }
+          # Scrub the registry path out of anything that lands in the artifact.
+          # Masking covers the job log only; the artifact is downloadable while the
+          # run exists.
+          scrub() { python3 -c 'import sys; p=sys.argv[1]; d=sys.stdin.read(); sys.stdout.write(d.replace(p,"<base>/") if p else d)' "$IMAGE_PREFIX"; }
+          stage() {
+            local name=$1; shift
+            local t0 t1 rc
+            t0=$(now); "$@" > "out/$name.log" 2>&1; rc=$?; t1=$(now)
+            echo "$name $rc $(python3 -c "print(round($t1-$t0,2))")" >> out/stages.txt
+            tail -c 20000 "out/$name.log" | scrub > "out/$name.tail"; rm -f "out/$name.log"
+            return $rc
+          }
+
+          echo "cpus=$(nproc) mem_mb=$(free -m | awk '/Mem:/{print $2}')" > out/runner.txt
+
+          finish() {
+            python3 - <<'PY'
+          import json, os, pathlib
+          out = pathlib.Path("out")
+          stages = {}
+          for line in (out / "stages.txt").read_text().splitlines():
+              n, rc, s = line.split()
+              tail = out / f"{n}.tail"
+              stages[n] = {"rc": int(rc), "seconds": float(s),
+                           "tail": tail.read_text(errors="replace") if tail.exists() else ""}
+          json.dump({
+              "request_id": os.environ["IN_ID"], "repo": os.environ["IN_REPO"],
+              "sha": os.environ["IN_SHA"], "image": os.environ["IN_IMAGE"],
+              "command": os.environ["IN_CMD"], "timeout_min": os.environ["IN_TIMEOUT"],
+              "runner": (out / "runner.txt").read_text().strip(),
+              "ran_as": "root", "stages": stages,
+          }, open(out / "result.json", "w"), indent=1)
+          PY
+          }
+          trap finish EXIT
+
+          # Clone on the host: shallow fetch by SHA, full clone if the SHA is short.
+          stage clone bash -c 'git init -q src && git -C src fetch -q --depth 1 "https://github.com/$IN_REPO" "$IN_SHA" && git -C src checkout -q FETCH_HEAD' \
+            || stage clone_full bash -c 'rm -rf src && git clone -q "https://github.com/$IN_REPO" src && git -C src checkout -q "$IN_SHA"' \
+            || exit 0
+          stage submodules git -C src submodule update --init --recursive --depth 1 -q || true
+
+          stage pull docker pull -q "$IMAGE" || exit 0
+
+          # One long-lived container so install and both test runs share state.
+          # Root avoids uid clashes on the bind mount; a few suites behave
+          # differently as root, which is recorded in the result.
+          docker run -d --name w --user 0:0 -v "$PWD/src:/work" -w /work --entrypoint sleep "$IMAGE" infinity >/dev/null || exit 0
+
+          # Base-image traps, applied before anything runs. Each of these makes a
+          # healthy repo look broken if ignored.
+          case "$IN_IMAGE" in
+            typescript) ENVSH='export CI=true NODE_ENV=development' ;;   # NODE_ENV=production drops devDeps
+            rust)       ENVSH='export CI=true PATH=/opt/cargo/bin:$PATH' ;;  # cargo is not on PATH
+            *)          ENVSH='export CI=true' ;;
+          esac
+          docker exec -i w bash -c 'cat > /tmp/env.sh' <<< "$ENVSH"
+
+          case "$IN_IMAGE" in
+            typescript) INSTALL='if [ -f pnpm-lock.yaml ]; then corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile --prod=false || pnpm install --prod=false; elif [ -f yarn.lock ]; then corepack enable >/dev/null 2>&1; yarn install --frozen-lockfile --production=false || yarn install --production=false; elif [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi' ;;
+            go)         INSTALL='go mod download' ;;
+            python)     INSTALL='python -m pip install -q -e . || python -m pip install -q -r requirements.txt; python -m pip install -q pytest' ;;  # never .[all]
+            rust)       INSTALL='cargo fetch' ;;
+            jvm)        INSTALL='mkdir -p ~/.gradle && printf "org.gradle.java.installations.paths=/opt/jdk-25\norg.gradle.java.installations.auto-download=false\n" >> ~/.gradle/gradle.properties; if [ -x ./gradlew ]; then ./gradlew --no-daemon -q dependencies >/dev/null || true; elif [ -f pom.xml ]; then mvn -q -B dependency:go-offline || true; fi' ;;
+            cpp)        INSTALL='true' ;;
+          esac
+          # bash -c, not -lc: a login shell re-reads /etc/profile and resets the
+          # PATH the image set, which hides go, cargo and friends.
+          stage install docker exec -e INSTALL="$INSTALL" w bash -c '. /tmp/env.sh; eval "$INSTALL"' || true
+
+          # Twice: the first run pays for compilation and cold caches.
+          for run in test_cold test_warm; do
+            stage "$run" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" w bash -c '. /tmp/env.sh; timeout "${T}m" bash -c "$IN_CMD"' || true
+          done
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: out/result.json
+          retention-days: 1
+          if-no-files-found: ignore
