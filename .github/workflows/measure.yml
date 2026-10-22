@@ -1,7 +1,14 @@
-# Measures how long a repository's existing test suite takes inside a base image.
+# Measures a repository's existing test suite inside a base image: whether it
+# passes on a clean checkout, how long it takes, and whether its results hold
+# still across identical runs.
 #
-# Copy to .github/workflows/measure.yml in the runner repo. It is committed ONCE:
-# everything per-run arrives as dispatch inputs, so git history never grows.
+# This mirrors the BASE half of the platform's pre-solution checks, and nothing
+# else -- no test or solution patch is ever applied here:
+#   Verify Tests      base must pass on the clean repo
+#   Verify Flakiness  no test may change its result between identical runs
+#
+# Committed ONCE: everything per-run arrives as dispatch inputs, so git history
+# never grows.
 #
 # The base image's registry path is a repository SECRET (IMAGE_PREFIX), never an
 # input: secrets are masked from the first line of the log, while inputs print in
@@ -18,6 +25,7 @@ on:
       image:       { description: "go | typescript | python | rust | cpp | jvm", required: true, type: string }
       command:     { description: "test command", required: true, type: string }
       timeout_min: { description: "limit per test run; over it means too slow", required: false, type: string, default: "10" }
+      runs:        { description: "identical test runs, 2-5, compared for flakiness", required: false, type: string, default: "3" }
 
 permissions: {}
 
@@ -53,6 +61,7 @@ jobs:
           IN_IMAGE: ${{ inputs.image }}
           IN_CMD: ${{ inputs.command }}
           IN_TIMEOUT: ${{ inputs.timeout_min }}
+          IN_RUNS: ${{ inputs.runs }}
           IN_ID: ${{ inputs.request_id }}
         run: |
           # GitHub runs this with bash -e. Failures are recorded per stage instead of
@@ -67,6 +76,7 @@ jobs:
           [[ "$IN_SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "bad sha"; exit 2; }
           case "$IN_IMAGE" in go|typescript|python|rust|cpp|jvm) ;; *) echo "bad image"; exit 2;; esac
           [[ "$IN_TIMEOUT" =~ ^[0-9]+$ ]] || IN_TIMEOUT=10
+          [[ "$IN_RUNS" =~ ^[2-5]$ ]] || IN_RUNS=3
           IMAGE="${IMAGE_PREFIX}${IN_IMAGE}:latest"
 
           now() { date +%s.%N; }
@@ -74,11 +84,97 @@ jobs:
           # Masking covers the job log only; the artifact is downloadable while the
           # run exists.
           scrub() { python3 -c 'import sys; p=sys.argv[1]; d=sys.stdin.read(); sys.stdout.write(d.replace(p,"<base>/") if p else d)' "$IMAGE_PREFIX"; }
+
+          # Per-test outcomes for one run, read the way each framework already
+          # reports them -- the test command itself is never modified.
+          parse_tests() {
+            python3 - "$1" <<'PY'
+          import glob, json, re, sys
+          import xml.etree.ElementTree as ET
+          name = sys.argv[1]
+          log = open(f"out/{name}.log", encoding="utf-8", errors="replace").read()
+          log = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", log)
+          tests, how = {}, "none"
+
+          # JUnit XML the framework writes itself: Maven surefire and Gradle by
+          # default, pytest through PYTEST_ADDOPTS. Cleared before every run.
+          xmls = (glob.glob("src/**/target/surefire-reports/*.xml", recursive=True)
+                  + glob.glob("src/**/build/test-results/**/*.xml", recursive=True)
+                  + glob.glob("src/.bench-junit/*.xml"))
+          for f in xmls:
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              for tc in root.iter("testcase"):
+                  tid = f"{tc.get('classname', '')}::{tc.get('name', '')}"
+                  st = "pass"
+                  for ch in tc:
+                      if ch.tag in ("failure", "error"):
+                          st = "fail"
+                      elif ch.tag == "skipped" and st == "pass":
+                          st = "skip"
+                  tests[tid] = st
+          if tests:
+              how = "per-test (junit)"
+
+          # Go, made verbose through GOFLAGS=-v. A package's tests print BEFORE its
+          # "ok"/"FAIL" summary line, so they are held until that line names the
+          # package -- the package is the area a test.sh exclusion is written against.
+          if not tests:
+              pending = []
+              for line in log.splitlines():
+                  m = re.match(r"\s*--- (PASS|FAIL|SKIP): (\S+)", line)
+                  if m:
+                      pending.append((m.group(2), {"PASS": "pass", "FAIL": "fail", "SKIP": "skip"}[m.group(1)]))
+                      continue
+                  m = re.match(r"(ok|FAIL)\s+(\S+)", line)
+                  if m and pending:
+                      for t, st in pending:
+                          tests[f"{m.group(2)}::{t}"] = st
+                      pending = []
+              for t, st in pending:  # a package that crashed before its summary line
+                  tests[f"?::{t}"] = st
+              if tests:
+                  how = "per-test (go -v)"
+
+          # Cargo lists every test by default. Names repeat across test binaries, so
+          # each is prefixed with the binary it ran in.
+          if not tests:
+              binary = ""
+              for line in log.splitlines():
+                  m = re.match(r"\s*Running (?:unittests )?(\S+)", line)
+                  if m:
+                      binary = m.group(1)
+                      continue
+                  if line.strip().startswith("Doc-tests"):
+                      binary = line.strip()
+                      continue
+                  m = re.match(r"test (.+?) \.\.\. (ok|FAILED|ignored)", line)
+                  if m:
+                      tests[f"{binary}::{m.group(1)}"] = {"ok": "pass", "FAILED": "fail", "ignored": "skip"}[m.group(2)]
+              if tests:
+                  how = "per-test (cargo)"
+
+          # Jest and Vitest report per FILE by default, not per test.
+          if not tests:
+              for m in re.finditer(r"^\s*(PASS|FAIL) (\S+)", log, re.M):
+                  tests["file::" + m.group(2)] = "pass" if m.group(1) == "PASS" else "fail"
+              for m in re.finditer(r"^\s*([✓×❯]) (\S+\.[cm]?[jt]sx?)\b", log, re.M):
+                  tests["file::" + m.group(2)] = "pass" if m.group(1) == "✓" else "fail"
+              if tests:
+                  how = "per-file (jest/vitest)"
+
+          json.dump({"how": how, "tests": tests}, open(f"out/{name}.tests.json", "w"))
+          PY
+          }
+
           stage() {
             local name=$1; shift
             local t0 t1 rc
             t0=$(now); "$@" > "out/$name.log" 2>&1; rc=$?; t1=$(now)
             echo "$name $rc $(python3 -c "print(round($t1-$t0,2))")" >> out/stages.txt
+            case "$name" in test_*) parse_tests "$name" ;; esac
             tail -c 20000 "out/$name.log" | scrub > "out/$name.tail"; rm -f "out/$name.log"
             return $rc
           }
@@ -94,13 +190,63 @@ jobs:
               n, rc, s = line.split()
               tail = out / f"{n}.tail"
               stages[n] = {"rc": int(rc), "seconds": float(s),
-                           "tail": tail.read_text(errors="replace") if tail.exists() else ""}
+                           "tail": tail.read_text(encoding="utf-8", errors="replace") if tail.exists() else ""}
+
+          def problem_areas(flaky, always_fail):
+              # The part of a test id before "::" is its package, module, class or
+              # file -- the unit a test.sh exclusion and a task's blast radius are
+              # expressed in.
+              areas = {}
+              for kind, ids in (("flaky", flaky), ("always_fail", always_fail)):
+                  for t in ids:
+                      a = t.split("::", 1)[0] or "?"
+                      areas.setdefault(a, {"flaky": 0, "always_fail": 0})[kind] += 1
+              return dict(sorted(areas.items(), key=lambda kv: -sum(kv[1].values()))[:30])
+
+          # The base verdict across identical runs: does the suite pass on a clean
+          # checkout every time, and does any test change its result between runs?
+          runs = [n for n in stages if n.startswith("test_")]
+          done = [n for n in runs if stages[n]["rc"] not in (-1, 124)]
+          per = {}
+          for n in done:
+              f = out / f"{n}.tests.json"
+              if f.exists():
+                  per[n] = json.loads(f.read_text())
+          ids = set()
+          for p in per.values():
+              ids |= set(p["tests"])
+          # A test missing from one run counts as changing result: the platform sees
+          # the same disagreement whichever way it arose.
+          flaky = sorted(t for t in ids if len({p["tests"].get(t, "absent") for p in per.values()}) > 1)
+          always_fail = sorted(t for t in ids if per and all(p["tests"].get(t) == "fail" for p in per.values()))
+          base = {
+              "runs_completed": len(done),
+              "runs_timed_out": sum(1 for n in runs if stages[n]["rc"] == 124),
+              "passes": bool(done) and all(stages[n]["rc"] == 0 for n in done),
+              "exit_codes": [stages[n]["rc"] for n in runs],
+              # Different exit codes across identical runs is flakiness even when no
+              # per-test detail could be read.
+              "exit_code_unstable": len({stages[n]["rc"] for n in done}) > 1,
+              "granularity": sorted({p["how"] for p in per.values()}) or ["none"],
+              "counts": {n: {k: sum(1 for v in p["tests"].values() if v == k)
+                             for k in ("pass", "fail", "skip")} for n, p in per.items()},
+              "flaky_count": len(flaky), "flaky": flaky[:50],
+              # Failing in EVERY run is deterministic -- excludable in test.sh with a
+              # reason -- which is a different finding from a suite that flickers.
+              "always_fail_count": len(always_fail), "always_fail": always_fail[:50],
+              # Where the problems are. Tests outside the area a task touches can be
+              # excluded; tests inside it cannot, so this is what decides whether a
+              # flaky repo is still usable and where in it a task can live.
+              "problem_areas": problem_areas(flaky, always_fail),
+              "tests_ran_offline": (out / "test_network").exists()
+                                   and (out / "test_network").read_text().strip() == "none",
+          }
           json.dump({
               "request_id": os.environ["IN_ID"], "repo": os.environ["IN_REPO"],
               "sha": os.environ["IN_SHA"], "image": os.environ["IN_IMAGE"],
               "command": os.environ["IN_CMD"], "timeout_min": os.environ["IN_TIMEOUT"],
               "runner": (out / "runner.txt").read_text().strip(),
-              "ran_as": "root", "stages": stages,
+              "ran_as": "root", "stages": stages, "base": base,
               "image_source": (out / "image_source").read_text().strip()
                               if (out / "image_source").exists() else "none",
           }, open(out / "result.json", "w"), indent=1)
@@ -130,20 +276,23 @@ jobs:
             exit 0
           fi
 
-          # One long-lived container so install and both test runs share state.
+          # One long-lived container so install and every test run share state.
           # Docker names need at least two characters -- "w" fails before anything runs.
           # Root avoids uid clashes on the bind mount; a few suites behave
           # differently as root, which is recorded in the result.
-          docker run -d --name bench --user 0:0 -v "$PWD/src:/work" -w /work --entrypoint sleep "$IMAGE" infinity >/dev/null || exit 0
+          # Mounted at /app because that is the platform's WORKDIR: a test that builds
+          # a path from its own location should see the same path it will be graded at.
+          docker run -d --name bench --user 0:0 -v "$PWD/src:/app" -w /app --entrypoint sleep "$IMAGE" infinity >/dev/null || exit 0
 
-          # Base-image traps, applied before anything runs. Each of these makes a
-          # healthy repo look broken if ignored.
-          # The result-cache switches keep the WARM run honest: it should reuse the
-          # build, not replay the cold run's results. Without -count=1 a second
-          # `go test` prints "(cached)" for every package and executes nothing.
+          # Base-image traps, applied before anything runs -- each makes a healthy
+          # repo look broken if ignored. The result-cache switches keep repeat runs
+          # honest: a second `go test` would otherwise print "(cached)" and execute
+          # nothing. The report switches make per-test results readable without
+          # changing the test command.
           case "$IN_IMAGE" in
             typescript) ENVSH='export CI=true NO_COLOR=1 FORCE_COLOR=0 NODE_ENV=development TURBO_FORCE=true NX_SKIP_NX_CACHE=true' ;;   # NODE_ENV=production drops devDeps
-            go)         ENVSH='export CI=true NO_COLOR=1 GOFLAGS=-count=1' ;;
+            go)         ENVSH='export CI=true NO_COLOR=1 GOFLAGS="-count=1 -v"' ;;
+            python)     ENVSH='export CI=true NO_COLOR=1 FORCE_COLOR=0 PYTEST_ADDOPTS=--junitxml=/app/.bench-junit/pytest.xml' ;;
             rust)       ENVSH='export CI=true NO_COLOR=1 CARGO_TERM_COLOR=never PATH=/opt/cargo/bin:$PATH' ;;  # cargo is not on PATH
             *)          ENVSH='export CI=true NO_COLOR=1 FORCE_COLOR=0' ;;
           esac
@@ -161,27 +310,42 @@ jobs:
           # PATH the image set, which hides go, cargo and friends.
           stage install docker exec -e INSTALL="$INSTALL" bench bash -c '. /tmp/env.sh; timeout 15m bash -c "$INSTALL"' || true
 
-          # Twice: the first run pays for compilation and cold caches.
-          # Gradle skips a test task whose outputs exist; removing them forces the
-          # tests to run while compilation stays up to date.
+          # The platform builds with network and runs every test with --network none.
+          # So installs happen online and tests offline, here too. A test that reaches
+          # the network then fails in every run and lands in always_fail -- which is
+          # exactly where it belongs, as an exclusion it needs in test.sh.
+          if docker network disconnect bridge bench >/dev/null 2>&1; then
+            echo none > out/test_network
+          else
+            echo "connected (disconnect failed)" > out/test_network
+          fi
+
+          # Every run starts with no test reports, so each run's results are its own.
+          # Removing Gradle's results also stops it skipping the test task as
+          # up-to-date, while compilation stays cached.
           clear_results() {
-            [ "$IN_IMAGE" = jvm ] && docker exec bench bash -c "find . -type d -path '*/build/test-results' -prune -exec rm -rf {} +" >/dev/null 2>&1
+            docker exec bench bash -c "find . \( -name node_modules -o -name .git \) -prune -o -type d \( -path '*/build/test-results' -o -path '*/target/surefire-reports' \) -prune -exec rm -rf {} + ; rm -rf .bench-junit" >/dev/null 2>&1
             return 0
           }
           run_tests() {
             stage "$1" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" bench bash -c '. /tmp/env.sh; timeout "${T}m" bash -c "$IN_CMD"'
           }
+          run_name() { case "$1" in 1) echo test_cold ;; 2) echo test_warm ;; *) echo "test_run$1" ;; esac; }
 
+          # The first run pays for compilation and cold caches; the rest are the
+          # honest timing, and all of them are compared for flakiness. If the first
+          # hit the limit, further runs would only continue the same build -- as
+          # slang showed -- so they are recorded as skipped instead.
           clear_results; run_tests test_cold; cold=$?
-          # Twice: the first run pays for compilation and cold caches. But if the
-          # first run hit the limit, a second one is not a warm run -- it just
-          # carries on the same build, as slang showed, and burns another limit.
-          if [ "$cold" = 124 ]; then
-            echo "test_warm -1 0" >> out/stages.txt
-            echo "skipped: the cold run hit the time limit, so a second run would only continue the same build" > out/test_warm.tail
-          else
-            clear_results; run_tests test_warm
-          fi
+          for i in $(seq 2 "$IN_RUNS"); do
+            n=$(run_name "$i")
+            if [ "$cold" = 124 ]; then
+              echo "$n -1 0" >> out/stages.txt
+              echo "skipped: the cold run hit the time limit, so another run would only continue the same build" > "out/$n.tail"
+            else
+              clear_results; run_tests "$n"
+            fi
+          done
 
       - name: save base image
         if: always() && steps.img.outputs.cache-hit != 'true' && hashFiles('out/save_cache') != ''
