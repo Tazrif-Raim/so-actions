@@ -96,11 +96,22 @@ jobs:
           log = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", log)
           tests, how = {}, "none"
 
+          def add(tid, st):
+              # Parameterised cases often share one name -- Chronicle-Wire ran 11,407
+              # tests under 3,308 distinct names -- so repeats get an occurrence
+              # suffix instead of overwriting each other. Order is execution order,
+              # which is what makes the suffix stable from run to run.
+              key, n = tid, 2
+              while key in tests:
+                  key, n = f"{tid}#{n}", n + 1
+              tests[key] = st
+
           # JUnit XML the framework writes itself: Maven surefire and Gradle by
-          # default, pytest through PYTEST_ADDOPTS. Cleared before every run.
-          xmls = (glob.glob("src/**/target/surefire-reports/*.xml", recursive=True)
-                  + glob.glob("src/**/build/test-results/**/*.xml", recursive=True)
-                  + glob.glob("src/.bench-junit/*.xml"))
+          # default, pytest through PYTEST_ADDOPTS. Cleared before every run, and
+          # read in sorted order so occurrence suffixes line up across runs.
+          xmls = sorted(glob.glob("src/**/target/surefire-reports/*.xml", recursive=True)
+                        + glob.glob("src/**/build/test-results/**/*.xml", recursive=True)
+                        + glob.glob("src/.bench-junit/*.xml"))
           for f in xmls:
               try:
                   root = ET.parse(f).getroot()
@@ -114,7 +125,7 @@ jobs:
                           st = "fail"
                       elif ch.tag == "skipped" and st == "pass":
                           st = "skip"
-                  tests[tid] = st
+                  add(tid, st)
           if tests:
               how = "per-test (junit)"
 
@@ -131,10 +142,10 @@ jobs:
                   m = re.match(r"(ok|FAIL)\s+(\S+)", line)
                   if m and pending:
                       for t, st in pending:
-                          tests[f"{m.group(2)}::{t}"] = st
+                          add(f"{m.group(2)}::{t}", st)
                       pending = []
               for t, st in pending:  # a package that crashed before its summary line
-                  tests[f"?::{t}"] = st
+                  add(f"?::{t}", st)
               if tests:
                   how = "per-test (go -v)"
 
@@ -152,7 +163,7 @@ jobs:
                       continue
                   m = re.match(r"test (.+?) \.\.\. (ok|FAILED|ignored)", line)
                   if m:
-                      tests[f"{binary}::{m.group(1)}"] = {"ok": "pass", "FAILED": "fail", "ignored": "skip"}[m.group(2)]
+                      add(f"{binary}::{m.group(1)}", {"ok": "pass", "FAILED": "fail", "ignored": "skip"}[m.group(2)])
               if tests:
                   how = "per-test (cargo)"
 
@@ -192,15 +203,16 @@ jobs:
               stages[n] = {"rc": int(rc), "seconds": float(s),
                            "tail": tail.read_text(encoding="utf-8", errors="replace") if tail.exists() else ""}
 
-          def problem_areas(flaky, always_fail):
+          def problem_areas(flaky, always_fail, unstable):
               # The part of a test id before "::" is its package, module, class or
               # file -- the unit a test.sh exclusion and a task's blast radius are
               # expressed in.
               areas = {}
-              for kind, ids in (("flaky", flaky), ("always_fail", always_fail)):
+              for kind, ids in (("flaky", flaky), ("always_fail", always_fail),
+                                ("unstable_names", unstable)):
                   for t in ids:
                       a = t.split("::", 1)[0] or "?"
-                      areas.setdefault(a, {"flaky": 0, "always_fail": 0})[kind] += 1
+                      areas.setdefault(a, {"flaky": 0, "always_fail": 0, "unstable_names": 0})[kind] += 1
               return dict(sorted(areas.items(), key=lambda kv: -sum(kv[1].values()))[:30])
 
           # The base verdict across identical runs: does the suite pass on a clean
@@ -215,9 +227,14 @@ jobs:
           ids = set()
           for p in per.values():
               ids |= set(p["tests"])
-          # A test missing from one run counts as changing result: the platform sees
-          # the same disagreement whichever way it arose.
-          flaky = sorted(t for t in ids if len({p["tests"].get(t, "absent") for p in per.values()}) > 1)
+          # Two different findings, kept apart. FLAKY: the same test, a different
+          # result between runs -- real flakiness. UNSTABLE NAMES: a test present in
+          # only some runs because its name changes -- Chronicle-Wire names cases
+          # after the current time. Those pass every run, but if the platform matches
+          # tests by name across runs they may still trip its flakiness check.
+          everywhere = {t for t in ids if all(t in p["tests"] for p in per.values())}
+          flaky = sorted(t for t in everywhere if len({p["tests"][t] for p in per.values()}) > 1)
+          unstable = sorted(ids - everywhere)
           always_fail = sorted(t for t in ids if per and all(p["tests"].get(t) == "fail" for p in per.values()))
           base = {
               "runs_completed": len(done),
@@ -234,10 +251,11 @@ jobs:
               # Failing in EVERY run is deterministic -- excludable in test.sh with a
               # reason -- which is a different finding from a suite that flickers.
               "always_fail_count": len(always_fail), "always_fail": always_fail[:50],
+              "unstable_name_count": len(unstable), "unstable_names": unstable[:50],
               # Where the problems are. Tests outside the area a task touches can be
               # excluded; tests inside it cannot, so this is what decides whether a
               # flaky repo is still usable and where in it a task can live.
-              "problem_areas": problem_areas(flaky, always_fail),
+              "problem_areas": problem_areas(flaky, always_fail, unstable),
           }
           json.dump({
               "request_id": os.environ["IN_ID"], "repo": os.environ["IN_REPO"],
