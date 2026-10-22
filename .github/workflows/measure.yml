@@ -142,10 +142,10 @@ jobs:
           # build, not replay the cold run's results. Without -count=1 a second
           # `go test` prints "(cached)" for every package and executes nothing.
           case "$IN_IMAGE" in
-            typescript) ENVSH='export CI=true NODE_ENV=development TURBO_FORCE=true NX_SKIP_NX_CACHE=true' ;;   # NODE_ENV=production drops devDeps
-            go)         ENVSH='export CI=true GOFLAGS=-count=1' ;;
-            rust)       ENVSH='export CI=true PATH=/opt/cargo/bin:$PATH' ;;  # cargo is not on PATH
-            *)          ENVSH='export CI=true' ;;
+            typescript) ENVSH='export CI=true NO_COLOR=1 FORCE_COLOR=0 NODE_ENV=development TURBO_FORCE=true NX_SKIP_NX_CACHE=true' ;;   # NODE_ENV=production drops devDeps
+            go)         ENVSH='export CI=true NO_COLOR=1 GOFLAGS=-count=1' ;;
+            rust)       ENVSH='export CI=true NO_COLOR=1 CARGO_TERM_COLOR=never PATH=/opt/cargo/bin:$PATH' ;;  # cargo is not on PATH
+            *)          ENVSH='export CI=true NO_COLOR=1 FORCE_COLOR=0' ;;
           esac
           docker exec -i bench bash -c 'cat > /tmp/env.sh' <<< "$ENVSH"
 
@@ -162,12 +162,26 @@ jobs:
           stage install docker exec -e INSTALL="$INSTALL" bench bash -c '. /tmp/env.sh; timeout 15m bash -c "$INSTALL"' || true
 
           # Twice: the first run pays for compilation and cold caches.
-          for run in test_cold test_warm; do
-            # Gradle skips a test task whose outputs exist; removing them forces the
-            # tests to run while compilation stays up to date.
+          # Gradle skips a test task whose outputs exist; removing them forces the
+          # tests to run while compilation stays up to date.
+          clear_results() {
             [ "$IN_IMAGE" = jvm ] && docker exec bench bash -c "find . -type d -path '*/build/test-results' -prune -exec rm -rf {} +" >/dev/null 2>&1
-            stage "$run" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" bench bash -c '. /tmp/env.sh; timeout "${T}m" bash -c "$IN_CMD"' || true
-          done
+            return 0
+          }
+          run_tests() {
+            stage "$1" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" bench bash -c '. /tmp/env.sh; timeout "${T}m" bash -c "$IN_CMD"'
+          }
+
+          clear_results; run_tests test_cold; cold=$?
+          # Twice: the first run pays for compilation and cold caches. But if the
+          # first run hit the limit, a second one is not a warm run -- it just
+          # carries on the same build, as slang showed, and burns another limit.
+          if [ "$cold" = 124 ]; then
+            echo "test_warm -1 0" >> out/stages.txt
+            echo "skipped: the cold run hit the time limit, so a second run would only continue the same build" > out/test_warm.tail
+          else
+            clear_results; run_tests test_warm
+          fi
 
       - name: save base image
         if: always() && steps.img.outputs.cache-hit != 'true' && hashFiles('out/save_cache') != ''
