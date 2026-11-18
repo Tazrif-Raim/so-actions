@@ -350,6 +350,17 @@ jobs:
                   d["tests"] = max(d["tests"], e["tests"])
           groups = sorted(({"group": g, "seconds": round(median(d["seconds"]), 3), "tests": d["tests"]}
                            for g, d in gs.items()), key=lambda e: -e["seconds"])
+          # A cold run that hit the time limit was interrupted, not killed, so the
+          # tests that finished are on record. They cannot give a verdict -- the
+          # rest never ran -- but they show where the time went.
+          if not groups and stages.get("test_cold", {}).get("rc") == 124:
+              f = out / "test_cold.tests.json"
+              if f.exists():
+                  pc = json.loads(f.read_text())
+                  base["partial_tests"] = len(pc.get("tests", {}))
+                  groups = sorted(({"group": g, "seconds": round(e["seconds"], 3), "tests": e["tests"]}
+                                   for g, e in pc.get("groups", {}).items()), key=lambda e: -e["seconds"])
+                  base["groups_partial"] = bool(groups)
           base["group_count"] = len(groups)
           base["group_seconds_total"] = round(sum(e["seconds"] for e in groups), 3)
           base["group_tests_total"] = sum(e["tests"] for e in groups)
@@ -460,7 +471,7 @@ jobs:
             return 0
           }
           run_tests() {
-            stage "$1" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" bench bash -c '. /tmp/env.sh; timeout "${T}m" bash -c "$IN_CMD"'
+            stage "$1" docker exec -e IN_CMD="$IN_CMD" -e T="$IN_TIMEOUT" bench bash -c '. /tmp/env.sh; timeout -s INT -k 30 "${T}m" bash -c "$IN_CMD"'
           }
           run_name() { case "$1" in 1) echo test_cold ;; 2) echo test_warm ;; *) echo "test_run$1" ;; esac; }
 
