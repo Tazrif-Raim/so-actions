@@ -24,6 +24,7 @@ on:
       sha:         { description: "commit to test", required: true, type: string }
       image:       { description: "go | typescript | python | rust | cpp | jvm", required: true, type: string }
       command:     { description: "test command", required: true, type: string }
+      setup:       { description: "build step run once before the tests (optional)", required: false, type: string, default: "" }
       timeout_min: { description: "limit per test run; over it means too slow", required: false, type: string, default: "10" }
       runs:        { description: "identical test runs, 2-5, compared for flakiness", required: false, type: string, default: "3" }
 
@@ -60,6 +61,7 @@ jobs:
           IN_SHA: ${{ inputs.sha }}
           IN_IMAGE: ${{ inputs.image }}
           IN_CMD: ${{ inputs.command }}
+          IN_SETUP: ${{ inputs.setup }}
           IN_TIMEOUT: ${{ inputs.timeout_min }}
           IN_RUNS: ${{ inputs.runs }}
           IN_ID: ${{ inputs.request_id }}
@@ -95,6 +97,21 @@ jobs:
           log = open(f"out/{name}.log", encoding="utf-8", errors="replace").read()
           log = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", log)
           tests, how = {}, "none"
+          # Where the time goes, per class / package / binary / file. This is what
+          # says whether a slow suite has one heavy corner that a test.sh could
+          # leave out, or is slow everywhere.
+          groups = {}
+
+          def timed(g, secs, n=1):
+              e = groups.setdefault(g or "?", {"seconds": 0.0, "tests": 0})
+              e["seconds"] += secs
+              e["tests"] += n
+
+          def num(s):
+              try:
+                  return float(s)
+              except (TypeError, ValueError):
+                  return 0.0
 
           def add(tid, st):
               # Parameterised cases often share one name -- Chronicle-Wire ran 11,407
@@ -117,8 +134,18 @@ jobs:
                   root = ET.parse(f).getroot()
               except Exception:
                   continue
+              pytest = ".bench-junit" in f
               for tc in root.iter("testcase"):
                   tid = f"{tc.get('classname', '')}::{tc.get('name', '')}"
+                  # pytest's classname is module.Class; the module is the unit a
+                  # test.sh would leave out, so the class segments are dropped.
+                  g = tc.get("classname", "")
+                  if pytest:
+                      parts = g.split(".")
+                      while len(parts) > 1 and parts[-1][:1].isupper():
+                          parts.pop()
+                      g = ".".join(parts)
+                  timed(g, num(tc.get("time")))
                   st = "pass"
                   for ch in tc:
                       if ch.tag in ("failure", "error"):
@@ -143,6 +170,10 @@ jobs:
                   if m and pending:
                       for t, st in pending:
                           add(f"{m.group(2)}::{t}", st)
+                      # The package's own wall time, not the sum of its tests:
+                      # subtests nest and parallel tests overlap.
+                      s = re.search(r"\s([\d.]+)s\s*$", line)
+                      timed(m.group(2), num(s.group(1)) if s else 0.0, len(pending))
                       pending = []
               for t, st in pending:  # a package that crashed before its summary line
                   add(f"?::{t}", st)
@@ -152,31 +183,65 @@ jobs:
           # Cargo lists every test by default. Names repeat across test binaries, so
           # each is prefixed with the binary it ran in.
           if not tests:
-              binary = ""
+              binary, count = "", 0
               for line in log.splitlines():
                   m = re.match(r"\s*Running (?:unittests )?(\S+)", line)
                   if m:
-                      binary = m.group(1)
+                      binary, count = m.group(1), 0
                       continue
                   if line.strip().startswith("Doc-tests"):
-                      binary = line.strip()
+                      binary, count = line.strip(), 0
                       continue
                   m = re.match(r"test (.+?) \.\.\. (ok|FAILED|ignored)", line)
                   if m:
                       add(f"{binary}::{m.group(1)}", {"ok": "pass", "FAILED": "fail", "ignored": "skip"}[m.group(2)])
+                      count += 1
+                      continue
+                  # One summary per test binary, with that binary's wall time.
+                  m = re.match(r"test result: .*finished in ([\d.]+)s", line)
+                  if m:
+                      timed(binary, num(m.group(1)), count)
               if tests:
                   how = "per-test (cargo)"
 
           # Jest and Vitest report per FILE by default, not per test.
           if not tests:
-              for m in re.finditer(r"^\s*(PASS|FAIL) (\S+)", log, re.M):
+              # Jest prints a file's time only when it is slow, "(5.123 s)"; Vitest
+              # always does, "(12 tests) 345ms". A file without one counts as zero,
+              # which is fine: the heavy files are exactly the ones that print it.
+              def dur(rest):
+                  m = re.search(r"([\d.]+)\s*(ms|s)\b", rest)
+                  if not m:
+                      return 0.0
+                  return num(m.group(1)) / (1000 if m.group(2) == "ms" else 1)
+              for m in re.finditer(r"^\s*(PASS|FAIL) (\S+)(.*)$", log, re.M):
                   tests["file::" + m.group(2)] = "pass" if m.group(1) == "PASS" else "fail"
-              for m in re.finditer(r"^\s*([✓×❯]) (\S+\.[cm]?[jt]sx?)\b", log, re.M):
+                  timed(m.group(2), dur(m.group(3)))
+              for m in re.finditer(r"^\s*([✓×❯]) (\S+\.[cm]?[jt]sx?)\b(.*)$", log, re.M):
                   tests["file::" + m.group(2)] = "pass" if m.group(1) == "✓" else "fail"
+                  n = re.search(r"\((\d+) tests?", m.group(3))
+                  timed(m.group(2), dur(m.group(3)), int(n.group(1)) if n else 1)
               if tests:
                   how = "per-file (jest/vitest)"
 
-          json.dump({"how": how, "tests": tests}, open(f"out/{name}.tests.json", "w"))
+          # Harnesses that print only per-suite summaries -- Python unittest's
+          # "Ran 35 tests in 3.489s" under a "Running <suite>" banner, as usd-brep's
+          # does -- give no per-test ids. Each summary is still a group with a count
+          # and a time, which is enough to see where a slow suite spends it.
+          if not tests and not groups:
+              label = "?"
+              for line in log.splitlines():
+                  m = re.match(r"\s*Running (.+?)\s*$", line)
+                  if m:
+                      label = m.group(1)
+                      continue
+                  m = re.match(r"Ran (\d+) tests? in ([\d.]+)s", line)
+                  if m:
+                      timed(label, num(m.group(2)), int(m.group(1)))
+              if groups:
+                  how = "per-suite (summary lines)"
+
+          json.dump({"how": how, "tests": tests, "groups": groups}, open(f"out/{name}.tests.json", "w"))
           PY
           }
 
@@ -257,10 +322,37 @@ jobs:
               # flaky repo is still usable and where in it a task can live.
               "problem_areas": problem_areas(flaky, always_fail, unstable),
           }
+
+          # Timing. The cold run carries first-run costs a test image pays once at
+          # build time, so when there are later runs only they are timed.
+          def median(xs):
+              xs = sorted(xs)
+              if not xs:
+                  return None
+              k = len(xs) // 2
+              return xs[k] if len(xs) % 2 else (xs[k - 1] + xs[k]) / 2
+          timed_runs = done[1:] if len(done) >= 2 else done
+          base["suite_seconds"] = median([stages[n]["seconds"] for n in timed_runs])
+          base["timed_runs"] = timed_runs
+          # Per-group time, median across the timed runs. All groups count toward
+          # the totals; only the heaviest are listed.
+          gs = {}
+          for n in timed_runs:
+              for g, e in per.get(n, {}).get("groups", {}).items():
+                  d = gs.setdefault(g, {"seconds": [], "tests": 0})
+                  d["seconds"].append(e["seconds"])
+                  d["tests"] = max(d["tests"], e["tests"])
+          groups = sorted(({"group": g, "seconds": round(median(d["seconds"]), 3), "tests": d["tests"]}
+                           for g, d in gs.items()), key=lambda e: -e["seconds"])
+          base["group_count"] = len(groups)
+          base["group_seconds_total"] = round(sum(e["seconds"] for e in groups), 3)
+          base["group_tests_total"] = sum(e["tests"] for e in groups)
+          base["groups"] = groups[:40]
           json.dump({
               "request_id": os.environ["IN_ID"], "repo": os.environ["IN_REPO"],
               "sha": os.environ["IN_SHA"], "image": os.environ["IN_IMAGE"],
-              "command": os.environ["IN_CMD"], "timeout_min": os.environ["IN_TIMEOUT"],
+              "command": os.environ["IN_CMD"], "setup": os.environ.get("IN_SETUP", ""),
+              "timeout_min": os.environ["IN_TIMEOUT"],
               "runner": (out / "runner.txt").read_text().strip(),
               "ran_as": "root", "stages": stages, "base": base,
               "image_source": (out / "image_source").read_text().strip()
@@ -322,12 +414,33 @@ jobs:
             go)         INSTALL='go mod download' ;;
             python)     INSTALL='python -m pip install -q -e . || python -m pip install -q -r requirements.txt; python -m pip install -q pytest' ;;  # never .[all]
             rust)       INSTALL='cargo fetch && cargo build --tests' ;;  # compiles test binaries, runs none
-            jvm)        INSTALL='mkdir -p ~/.gradle && printf "org.gradle.java.installations.paths=/opt/jdk-25\norg.gradle.java.installations.auto-download=false\n" >> ~/.gradle/gradle.properties; if [ -x ./gradlew ]; then ./gradlew --no-daemon -q testClasses; elif [ -f pom.xml ]; then mvn -B -ntp -q -DskipTests test-compile || true; fi' ;;
+            # org.gradle.caching=false: a repo that enables the build cache (kestra
+            # does) would have runs 2 and 3 restore the test task FROM-CACHE and
+            # execute nothing. The user-home file outranks the project's own.
+            jvm)        INSTALL='mkdir -p ~/.gradle && printf "org.gradle.java.installations.paths=/opt/jdk-25\norg.gradle.java.installations.auto-download=false\norg.gradle.caching=false\n" >> ~/.gradle/gradle.properties; if [ -x ./gradlew ]; then ./gradlew --no-daemon -q testClasses; elif [ -f pom.xml ]; then mvn -B -ntp -q -DskipTests test-compile || true; fi' ;;
             cpp)        INSTALL='true' ;;
           esac
           # bash -c, not -lc: a login shell re-reads /etc/profile and resets the
           # PATH the image set, which hides go, cargo and friends.
           stage install docker exec -e INSTALL="$INSTALL" bench bash -c '. /tmp/env.sh; timeout 15m bash -c "$INSTALL"' || true
+
+          # The image defaults to JDK 17, but a build may need a newer JVM just to
+          # START: kestra's own Gradle plugins refuse anything below 21, so nothing
+          # ran at all. When install fails that way, JDK 25 becomes the JVM for
+          # everything after it, and install is retried.
+          if [ "$IN_IMAGE" = jvm ] && grep -qE 'requires at least JVM runtime version|invalid (source|target) release|release version [0-9]+ not supported|UnsupportedClassVersionError|class file version [0-9]+' out/install.tail 2>/dev/null; then
+            echo 'export JAVA_HOME=/opt/jdk-25 PATH=/opt/jdk-25/bin:$PATH' | docker exec -i bench bash -c 'cat >> /tmp/env.sh'
+            stage install_jdk25 docker exec -e INSTALL="$INSTALL" bench bash -c '. /tmp/env.sh; timeout 15m bash -c "$INSTALL"' || true
+          fi
+
+          # The repo's own build, when its test command would otherwise compile
+          # everything on every run. A test image does that once, at build time, so
+          # timing it inside each run measures the wrong thing: slang spent both of
+          # its 10-minute windows compiling and never reached a test. 45 minutes
+          # because a large C++ build legitimately takes that long.
+          if [ -n "$IN_SETUP" ]; then
+            stage setup docker exec -e IN_SETUP="$IN_SETUP" bench bash -c '. /tmp/env.sh; timeout 45m bash -c "$IN_SETUP"' || true
+          fi
 
           # Tests run WITH network, deliberately. Offline cost whole measurements for
           # setup reasons -- Chronicle-Wire passed 11,407 tests online and produced
