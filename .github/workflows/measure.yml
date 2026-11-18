@@ -26,6 +26,7 @@ on:
       command:     { description: "test command", required: true, type: string }
       setup:       { description: "build step run once before the tests (optional)", required: false, type: string, default: "" }
       timeout_min: { description: "limit per test run; over it means too slow", required: false, type: string, default: "10" }
+      stop_after: { description: "seconds; a cold run over this skips the remaining runs", required: false, type: string, default: "" }
       runs:        { description: "identical test runs, 2-5, compared for flakiness", required: false, type: string, default: "3" }
 
 permissions: {}
@@ -63,6 +64,7 @@ jobs:
           IN_CMD: ${{ inputs.command }}
           IN_SETUP: ${{ inputs.setup }}
           IN_TIMEOUT: ${{ inputs.timeout_min }}
+          IN_STOP: ${{ inputs.stop_after }}
           IN_RUNS: ${{ inputs.runs }}
           IN_ID: ${{ inputs.request_id }}
         run: |
@@ -78,6 +80,7 @@ jobs:
           [[ "$IN_SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "bad sha"; exit 2; }
           case "$IN_IMAGE" in go|typescript|python|rust|cpp|jvm) ;; *) echo "bad image"; exit 2;; esac
           [[ "$IN_TIMEOUT" =~ ^[0-9]+$ ]] || IN_TIMEOUT=10
+          [[ "$IN_STOP" =~ ^[0-9]+$ ]] || IN_STOP=""
           [[ "$IN_RUNS" =~ ^[2-5]$ ]] || IN_RUNS=3
           IMAGE="${IMAGE_PREFIX}${IN_IMAGE}:latest"
 
@@ -332,6 +335,9 @@ jobs:
               k = len(xs) // 2
               return xs[k] if len(xs) % 2 else (xs[k - 1] + xs[k]) / 2
           timed_runs = done[1:] if len(done) >= 2 else done
+          if (out / "stopped_early").exists():
+              base["stopped_early"] = True
+              base["stop_after"] = float(os.environ.get("IN_STOP") or 0)
           base["suite_seconds"] = median([stages[n]["seconds"] for n in timed_runs])
           base["timed_runs"] = timed_runs
           # Per-group time, median across the timed runs. All groups count toward
@@ -463,11 +469,22 @@ jobs:
           # hit the limit, further runs would only continue the same build -- as
           # slang showed -- so they are recorded as skipped instead.
           clear_results; run_tests test_cold; cold=$?
+          # A cold run already past the caller's limit decides the verdict: the
+          # warm runs could only confirm it, at the same cost again. Skip them.
+          over=0
+          if [ -n "$IN_STOP" ] && [ "$cold" != 124 ]; then
+            cold_s=$(awk '$1=="test_cold"{print $3}' out/stages.txt | tail -1)
+            over=$(python3 -c "print(1 if float('${cold_s:-0}') > float('$IN_STOP') else 0)")
+            [ "$over" = 1 ] && echo "$cold_s" > out/stopped_early
+          fi
           for i in $(seq 2 "$IN_RUNS"); do
             n=$(run_name "$i")
             if [ "$cold" = 124 ]; then
               echo "$n -1 0" >> out/stages.txt
               echo "skipped: the cold run hit the time limit, so another run would only continue the same build" > "out/$n.tail"
+            elif [ "$over" = 1 ]; then
+              echo "$n -1 0" >> out/stages.txt
+              echo "skipped: the cold run took ${cold_s}s, over the ${IN_STOP}s stop limit" > "out/$n.tail"
             else
               clear_results; run_tests "$n"
             fi
